@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -93,9 +94,9 @@ TEST_CASE("start_detached_stoppable can be cancelled", "[start_detached]") {
     auto s = S::schedule()                    //
              | async::then([&] { var = 42; }) //
              | async::upon_stopped([&] { var = 17; });
-    auto stop_src = async::start_detached_stoppable(s);
-    REQUIRE(stop_src.has_value());
-    stop_src.value()->request_stop();
+    auto stop_handle = async::start_detached_stoppable(s);
+    REQUIRE(stop_handle);
+    CHECK(stop_handle.request_stop());
     async::task_mgr::service_tasks<0>();
     CHECK(var == 17);
 }
@@ -107,12 +108,10 @@ TEST_CASE("start_detached_unstoppable has no cancellation",
     auto s = S::schedule()                    //
              | async::then([&] { var = 42; }) //
              | async::upon_stopped([&] { var = 17; });
-    auto stop_src = async::start_detached_unstoppable(s);
-    REQUIRE(stop_src.has_value());
-    STATIC_REQUIRE(
-        std::is_same_v<async::never_stop_source *,
-                       std::remove_cvref_t<decltype(stop_src.value())>>);
-    stop_src.value()->request_stop();
+    auto stop_handle = async::start_detached_unstoppable(s);
+    CHECK(stop_handle);
+    CHECK(not stop_handle.stop_possible());
+    CHECK(not stop_handle.request_stop());
     async::task_mgr::service_tasks<0>();
     CHECK(var == 42);
 }
@@ -239,8 +238,8 @@ template <>
 constexpr inline auto async::static_allocation_limit<alloc_domain> =
     std::size_t{2};
 
-TEST_CASE("stop_detached doesn't cancel the operation when the op state is "
-          "not a singleton",
+TEST_CASE("stop_detached doesn't cancel the operation when the op state is not "
+          "a singleton",
           "[start_detached]") {
     int var{};
     using S = async::fixed_priority_scheduler<0>;
@@ -330,7 +329,48 @@ TEST_CASE("stop_detached works with a string name", "[start_detached]") {
 
 TEST_CASE("start_detached is a synonym for start_detached_unstoppable",
           "[start_detached]") {
-    [[maybe_unused]] auto s = async::just();
-    STATIC_REQUIRE(std::same_as<decltype(async::start_detached(s)),
-                                stdx::optional<async::never_stop_source *>>);
+    auto s = async::just();
+    [[maybe_unused]] auto stop_handle = async::start_detached(s);
+    STATIC_CHECK(not stop_handle.stop_possible());
+}
+
+TEST_CASE("start_detached_stoppable can later be waited on using a handle",
+          "[start_detached]") {
+    int var{};
+    using S = async::fixed_priority_scheduler<0>;
+    auto s = S::schedule() | async::then([&] { var = 17; });
+    auto stop_handle = async::start_detached_stoppable(s);
+    REQUIRE(stop_handle);
+    REQUIRE(stop_handle.stop_possible());
+    CHECK(not stop_handle.is_complete());
+    bool sync_wait_success{};
+
+    auto t1 = std::thread{[&] { sync_wait_success = stop_handle.sync_wait(); }};
+    async::task_mgr::service_tasks<0>();
+    t1.join();
+
+    CHECK(stop_handle.is_complete());
+    CHECK(sync_wait_success);
+    CHECK(var == 17);
+}
+
+TEST_CASE("start_detached_stoppable can later be waited on using a name",
+          "[start_detached]") {
+    int var{};
+    using S = async::fixed_priority_scheduler<0>;
+    auto s = S::schedule() | async::then([&] { var = 17; });
+    auto stop_handle = async::start_detached_stoppable<"test">(s);
+    REQUIRE(stop_handle);
+    REQUIRE(stop_handle.stop_possible());
+    CHECK(not stop_handle.is_complete());
+    bool sync_wait_success{};
+
+    auto t1 = std::thread{
+        [&] { sync_wait_success = async::sync_wait_detached<"test">(); }};
+    async::task_mgr::service_tasks<0>();
+    t1.join();
+
+    CHECK(stop_handle.is_complete());
+    CHECK(sync_wait_success);
+    CHECK(var == 17);
 }

@@ -34,7 +34,7 @@ namespace async {
 namespace detail {
 #if HAS_CONDITION_VARIABLE
 struct synchronizer_impl {
-    template <typename... Fs> auto notify(Fs &&...fs) {
+    template <typename... Fs> auto notify(Fs &&...fs) -> void {
         std::unique_lock const l{m};
         (std::forward<Fs>(fs)(), ...);
         if constexpr (sizeof...(Fs) == 0) {
@@ -43,7 +43,7 @@ struct synchronizer_impl {
         cv.notify_one();
     }
 
-    template <typename... Ps> auto wait(Ps &&...ps) {
+    template <typename... Ps> auto wait(Ps &&...ps) -> void {
         std::unique_lock l{m};
         cv.wait(l, [&] { return (ps() or ... or done); });
     }
@@ -54,11 +54,36 @@ struct synchronizer_impl {
 };
 
 template <typename Uniq> using runloop_synchronizer = synchronizer_impl;
-using simple_synchronizer = synchronizer_impl;
 
+struct simple_synchronizer {
+    auto notify() -> void {
+        std::unique_lock const l{m};
+        done = true;
+        cv.notify_one();
+    }
+
+    auto reset() -> void {
+        std::unique_lock const l{m};
+        done = false;
+    }
+
+    auto is_complete() -> bool {
+        std::unique_lock const l{m};
+        return done;
+    }
+
+    auto wait() -> void {
+        std::unique_lock l{m};
+        cv.wait(l, [&] -> bool { return done; });
+    }
+
+    std::mutex m;
+    std::condition_variable cv;
+    bool done{};
+};
 #else
 template <typename Uniq> struct runloop_synchronizer {
-    template <typename... Fs> auto notify(Fs &&...fs) {
+    template <typename... Fs> auto notify(Fs &&...fs) -> void {
         conc::call_in_critical_section<Uniq>([&] {
             (std::forward<Fs>(fs)(), ...);
             if constexpr (sizeof...(Fs) == 0) {
@@ -67,7 +92,7 @@ template <typename Uniq> struct runloop_synchronizer {
         });
     }
 
-    template <typename P> auto wait(P &&p) {
+    template <typename P> auto wait(P &&p) -> void {
         conc::call_in_critical_section<Uniq>([] {},
                                              [&] { return p() or done; });
     }
@@ -76,9 +101,11 @@ template <typename Uniq> struct runloop_synchronizer {
 };
 
 struct simple_synchronizer {
-    auto notify() { done = true; }
+    auto notify() -> void { done = true; }
+    auto reset() -> void { done = false; }
+    auto is_complete() -> bool { return done; }
 
-    auto wait() {
+    auto wait() -> void {
         while (!done) {
         }
     }

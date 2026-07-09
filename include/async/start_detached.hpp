@@ -5,6 +5,7 @@
 #include <async/connect.hpp>
 #include <async/debug.hpp>
 #include <async/env.hpp>
+#include <async/schedulers/runloop_scheduler.hpp>
 #include <async/stop_token.hpp>
 
 #include <stdx/concepts.hpp>
@@ -14,7 +15,6 @@
 #include <conc/concurrency.hpp>
 
 #include <concepts>
-#include <functional>
 #include <type_traits>
 #include <utility>
 
@@ -40,7 +40,62 @@ template <typename Ops> struct receiver {
     }
 };
 
+struct never_stop_handle {
+    [[nodiscard]] constexpr auto started() const -> bool { return started_; }
+    constexpr explicit operator bool() const { return started_; }
+
+    [[nodiscard]] consteval static auto stop_possible() -> bool {
+        return false;
+    }
+    [[nodiscard]] consteval static auto stop_requested() -> bool {
+        return false;
+    }
+    [[nodiscard]] consteval static auto request_stop() -> bool { return false; }
+    [[nodiscard]] consteval static auto is_complete() -> bool { return false; }
+    [[nodiscard]] consteval static auto sync_wait() -> bool { return false; }
+
+    bool started_{};
+};
+
 template <typename Uniq> inplace_stop_source *stop_source_for{};
+template <typename Uniq>
+auto synchronizer_for = async::detail::simple_synchronizer{};
+
+template <typename Uniq> struct stop_handle : never_stop_handle {
+    [[nodiscard]] constexpr static auto stop_possible() -> bool {
+        return conc::call_in_critical_section<Uniq>([&] -> bool {
+            auto s = stop_source_for<Uniq>;
+            return s != nullptr and s->stop_possible();
+        });
+    }
+
+    [[nodiscard]] constexpr static auto stop_requested() -> bool {
+        return conc::call_in_critical_section<Uniq>([&] -> bool {
+            auto s = stop_source_for<Uniq>;
+            return s != nullptr and s->stop_requested();
+        });
+    }
+
+    [[nodiscard]] constexpr static auto request_stop() -> bool {
+        return conc::call_in_critical_section<Uniq>([&] -> bool {
+            auto s = stop_source_for<Uniq>;
+            return s != nullptr and s->request_stop();
+        });
+    }
+
+    static auto notify() -> void {
+        conc::call_in_critical_section<Uniq>(
+            [&] -> void { stop_source_for<Uniq> = nullptr; });
+        synchronizer_for<Uniq>.notify();
+    }
+    [[nodiscard]] static auto is_complete() -> bool {
+        return synchronizer_for<Uniq>.is_complete();
+    }
+    [[nodiscard]] static auto sync_wait() -> bool {
+        synchronizer_for<Uniq>.wait();
+        return true;
+    }
+};
 
 template <typename Uniq, typename A, typename StopSource>
 constexpr auto use_single_stop_source =
@@ -89,7 +144,9 @@ struct op_state : op_state_base<StopSource, Env> {
 
     template <stdx::ct_string S> auto die() {
         debug_signal<S, debug::erased_context_for<op_state>>(this->e);
-        set_stop_source<Uniq, Alloc, StopSource>(nullptr);
+        if constexpr (use_single_stop_source<Uniq, Alloc, StopSource>) {
+            stop_handle<Uniq>{}.notify();
+        }
         Alloc::template destruct<Uniq>(this);
     }
 
@@ -102,7 +159,7 @@ struct op_state : op_state_base<StopSource, Env> {
 };
 
 template <typename Uniq, typename StopSource, sender S, typename Env>
-[[nodiscard]] auto start(S &&s, Env &&e) -> stdx::optional<StopSource *> {
+[[nodiscard]] auto start(S &&s, Env &&e) {
     using sndr_t = std::remove_cvref_t<S>;
     using custom_env_t = std::remove_cvref_t<Env>;
 
@@ -116,15 +173,19 @@ template <typename Uniq, typename StopSource, sender S, typename Env>
     using A = allocator_of_t<env<custom_env_t, env_of_t<sndr_t>, ops_env_t>>;
 
     using O = op_state<Uniq, sndr_t, A, StopSource, custom_env_t>;
-    stdx::optional<StopSource *> stop_src{};
-    A::template construct<Uniq, O>(
-        [&](O &ops) {
-            stop_src = std::addressof(ops.stop_src);
-            set_stop_source<Uniq, A>(std::addressof(ops.stop_src));
-            async::start(ops);
-        },
-        std::forward<S>(s), std::forward<Env>(e));
-    return stop_src;
+    if constexpr (use_single_stop_source<Uniq, A, StopSource>) {
+        return stop_handle<Uniq>{A::template construct<Uniq, O>(
+            [&](O &ops) {
+                set_stop_source<Uniq, A>(std::addressof(ops.stop_src));
+                synchronizer_for<Uniq>.reset();
+                async::start(ops);
+            },
+            std::forward<S>(s), std::forward<Env>(e))};
+    } else {
+        return never_stop_handle{A::template construct<Uniq, O>(
+            [&](O &ops) { async::start(ops); }, std::forward<S>(s),
+            std::forward<Env>(e))};
+    }
 }
 
 template <typename Uniq, typename StopSource, typename Env> struct pipeable {
@@ -219,14 +280,28 @@ template <stdx::ct_string Name, sender S, typename Env = empty_env>
 }
 
 template <typename Uniq> auto stop_detached() {
-    return conc::call_in_critical_section<Uniq>([] {
-        return _start_detached::stop_source_for<Uniq> != nullptr and
-               _start_detached::stop_source_for<Uniq>->request_stop();
-    });
+    return _start_detached::stop_handle<Uniq>{}.request_stop();
 }
 
 template <stdx::ct_string Name> auto stop_detached() {
     return stop_detached<stdx::cts_t<Name>>();
+}
+
+template <typename Uniq> auto sync_stop_detached() {
+    _start_detached::stop_handle<Uniq>{}.request_stop();
+    return _start_detached::stop_handle<Uniq>{}.sync_wait();
+}
+
+template <stdx::ct_string Name> auto sync_stop_detached() {
+    return sync_stop_detached<stdx::cts_t<Name>>();
+}
+
+template <typename Uniq> auto sync_wait_detached() {
+    return _start_detached::stop_handle<Uniq>{}.sync_wait();
+}
+
+template <stdx::ct_string Name> auto sync_wait_detached() {
+    return sync_wait_detached<stdx::cts_t<Name>>();
 }
 
 struct start_detached_t;
